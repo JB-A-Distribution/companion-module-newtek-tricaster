@@ -42,9 +42,7 @@ class TricasterInstance extends InstanceBase {
 		if (this.websocketPing) {
 			clearInterval(this.websocketPing)
 		}
-		if (this.reconnect) {
-			clearInterval(this.reconnect)
-		}
+		clearTimeout(this.retryTimer)
 	}
 
 	getConfigFields() {
@@ -68,6 +66,8 @@ class TricasterInstance extends InstanceBase {
 		this.config = config
 		this.updateStatus('connecting')
 		clearInterval(this.pollDatalink)
+		clearTimeout(this.retryTimer)
+		delete this.retryTimer
 
 		this.init(config)
 	}
@@ -93,10 +93,12 @@ class TricasterInstance extends InstanceBase {
 	}
 
 	async initConnection() {
+		clearTimeout(this.retryTimer)
 		let version = await this.awaitRequest('version')
 		let shortcuts = await this.awaitRequest('dictionary?key=shortcut_states') //This allows older firmware that don't support the version call to still connect
 
-		if (version?.product_information || shortcuts) {
+		if (version?.product_information || shortcuts?.shortcut_states) {
+			delete this.retryTimer
 			this.updateStatus('ok')
 			this.initStates()
 			this.initWebsocket()
@@ -105,7 +107,9 @@ class TricasterInstance extends InstanceBase {
 			this.initFeedbacks()
 			this.initPresets()
 
-			this.processData(version)
+			if (version) {
+				this.processData(version)
+			}
 			this.getInputs()
 
 			this.sendGetRequest('dictionary?key=macros_list')
@@ -122,8 +126,17 @@ class TricasterInstance extends InstanceBase {
 			}
 		} else {
 			this.updateStatus('connection_failure')
-			this.log('error', 'Unable to connect to Tricaster. Check your device address in the module settings')
+			// Only log the first failure; retryTimer stays set until a successful connection
+			if (!this.retryTimer) {
+				this.log('error', 'Unable to connect to Tricaster. Check your device address in the module settings')
+			}
+			this.retryConnection()
 		}
+	}
+
+	retryConnection() {
+		clearTimeout(this.retryTimer)
+		this.retryTimer = setTimeout(() => this.initConnection(), 3000)
 	}
 
 	initStates() {
@@ -220,7 +233,7 @@ class TricasterInstance extends InstanceBase {
 
 		let inputVars = {}
 
-		if (tallyData && states) {
+		if (tallyData?.tally && states?.shortcut_states) {
 			tallyData.tally.column.forEach((input) => {
 				//Create Inputs
 				//Regex prevents excess DDR/GFX A/B Inputs from being visible
@@ -338,7 +351,7 @@ class TricasterInstance extends InstanceBase {
 				}
 			})
 		}
-		if (transitions) {
+		if (transitions?.switcher_ui_effects) {
 			transitions.switcher_ui_effects.switcher.forEach((switcher) => {
 				if (switcher.name === 'main') {
 					let int = 0
@@ -366,17 +379,16 @@ class TricasterInstance extends InstanceBase {
 	}
 
 	initWebsocket() {
-		clearInterval(this.reconnect)
-
 		if (this.ws !== undefined) {
 			this.ws.close(1000)
 			delete this.ws
 		}
 
-		this.ws = new WebSocket(`ws://${this.config.host}/v1/change_notifications`)
+		const ws = (this.ws = new WebSocket(`ws://${this.config.host}/v1/change_notifications`))
 
 		this.ws.on('open', () => {
 			// ping server every 15 seconds to keep connection open
+			clearInterval(this.websocketPing)
 			this.websocketPing = setInterval(() => {
 				if (this.ws) {
 					if (this.ws.readyState == 1) {
@@ -401,11 +413,16 @@ class TricasterInstance extends InstanceBase {
 		})
 
 		this.ws.on('close', (code) => {
-			if (code !== 1000) {
-				this.reconnect = setInterval(() => {
-					this.initWebsocket()
-				}, 500)
-			}
+			// A socket we replaced or destroyed ourselves; anything else (any code) means the Tricaster went away
+			if (ws !== this.ws) return
+
+			delete this.ws
+			clearInterval(this.websocketPing)
+			clearInterval(this.pollDatalink)
+			this.updateStatus('connection_failure')
+			this.log('warn', `Lost connection to Tricaster (code ${code}), reconnecting`)
+			// Full re-init on reconnect, since a new session can have different inputs, names and macros
+			this.retryConnection()
 		})
 
 		this.ws.on('error', (data, isBinary) => {
@@ -443,6 +460,9 @@ class TricasterInstance extends InstanceBase {
 
 		try {
 			let result = await fetch(url)
+			if (!result.ok) {
+				throw new Error(`HTTP ${result.status} from ${url}`)
+			}
 			let data = await result.text()
 			let object = await parser.parse(data)
 			return object
@@ -512,6 +532,7 @@ class TricasterInstance extends InstanceBase {
 				pvw_source: pvwSource?.short_name ? pvwSource.short_name : data.switcher_update.preview_source,
 			})
 		} else if (data.macros) {
+			this.system_macros = []
 			this.custom_macros = []
 			data.macros.systemfolder.macro.forEach((macro) => {
 				this.system_macros.push({
